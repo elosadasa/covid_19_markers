@@ -399,3 +399,4 @@ fabric.properties
 
 # OS X files
 .DS_Store
+*.png
