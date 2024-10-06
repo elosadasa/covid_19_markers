@@ -483,13 +483,13 @@ def reshape_autoantibody_data_long(df: pd.DataFrame) -> pd.DataFrame:
         melted_df['Antigen'] = split_marker[1]
     else:
         # Handle cases where the split didn't result in two parts
-        logging.warning("Some markers could not be split into 'Immunoglobulin' and 'Antigen'. Assigning 'Unknown' to 'Immunoglobulin'.")
+        logging.warning(
+            "Some markers could not be split into 'Immunoglobulin' and 'Antigen'. Assigning 'Unknown' to 'Immunoglobulin'.")
         melted_df['Immunoglobulin'] = 'Unknown'
         melted_df['Antigen'] = melted_df['Marker']
 
     logging.info(f"Autoantibody data reshaped to long format with shape {melted_df.shape}.")
     return melted_df
-
 
 
 def compare_autoantibody_groups(group1_df: pd.DataFrame, group2_df: pd.DataFrame, group1_label: str,
@@ -557,6 +557,16 @@ def compare_autoantibody_groups(group1_df: pd.DataFrame, group2_df: pd.DataFrame
     return results_df
 
 
+def get_significant_markers(results_df, marker_column='Cytokine_Marker', adjusted_p_value_column='Adjusted_P_Value',
+                            significance_level=0.05):
+    """
+    Extracts significant markers based on adjusted p-values.
+    """
+    significant_markers = results_df[results_df[adjusted_p_value_column] < significance_level][marker_column].tolist()
+    logging.info(f"Found {len(significant_markers)} significant markers.")
+    return significant_markers
+
+
 def main():
     """
     Main function to process the data, perform comparisons, and execute PCA.
@@ -612,7 +622,7 @@ def main():
             # Extract group labels
             group_labels = combined_cytokine_df.set_index('Patient ID')['Group']
 
-            # Perform PCA
+            # Perform PCA with all the markers
             pca_cytokine, pca_cytokine_df = perform_pca(
                 df=pca_data,
                 n_components=2,
@@ -627,7 +637,39 @@ def main():
             group2_long_df = reshape_cytokine_data(group2_df)
 
             # Perform statistical comparison
-            compare_cytokine_groups(group1_long_df, group2_long_df, group1_label, group2_label)
+            cytokine_results_df = compare_cytokine_groups(group1_long_df, group2_long_df, group1_label, group2_label)
+
+            # Extract significant markers
+            significant_cytokine_markers = get_significant_markers(
+                cytokine_results_df,
+                marker_column='Cytokine_Marker',
+                adjusted_p_value_column='Adjusted_P_Value',
+                significance_level=0.05
+            )
+
+            if significant_cytokine_markers:
+                # Filter the combined cytokine data to include only significant markers
+                combined_cytokine_df_significant = combined_cytokine_df.copy()
+                significant_value_vars = significant_cytokine_markers
+
+                # Normalize the data (already normalized, so you may skip this step or ensure consistency)
+                # combined_cytokine_df_significant = normalize_data(combined_cytokine_df_significant, significant_value_vars)
+
+                # Prepare data for PCA with significant markers
+                pca_data_significant = combined_cytokine_df_significant.set_index('Patient ID')[significant_value_vars]
+
+                # Perform PCA with significant markers
+                pca_cytokine_significant, pca_cytokine_df_significant = perform_pca(
+                    df=pca_data_significant,
+                    n_components=2,
+                    group_labels=group_labels,
+                    title='PCA_Cytokine_Significant_Markers'
+                )
+                pca_cytokine_df_significant.to_csv('PCA_Cytokine_Significant_Markers.csv', index=False)
+                logging.info("PCA with significant cytokine markers saved to 'PCA_Cytokine_Significant_Markers.csv'.")
+            else:
+                logging.info("No significant cytokine markers found for PCA.")
+
         else:
             logging.warning(
                 f"One of the cytokine groups '{group1_label}' or '{group2_label}' is missing. Skipping Cytokine Comparisons.")
@@ -687,11 +729,44 @@ def main():
             group2_long_df = reshape_autoantibody_data_long(group2_df)
 
             # Perform statistical comparison
-            compare_autoantibody_groups(group1_long_df, group2_long_df, group1_label, group2_label)
+            autoantibody_results_df = compare_autoantibody_groups(group1_long_df, group2_long_df, group1_label,
+                                                                  group2_label)
+
+            # Extract significant markers
+            significant_autoantibody_markers = get_significant_markers(
+                autoantibody_results_df,
+                marker_column='Marker',
+                adjusted_p_value_column='Adjusted_P_Value',
+                significance_level=0.05
+            )
+
+            if significant_autoantibody_markers:
+                # Filter the combined autoantibody data to include only significant markers
+                combined_autoantibody_df_significant = combined_autoantibody_df.copy()
+                significant_marker_cols = significant_autoantibody_markers
+
+                # Normalize the data (already normalized, so you may skip this step or ensure consistency)
+                # combined_autoantibody_df_significant = normalize_autoantibody_data(combined_autoantibody_df_significant, significant_marker_cols)
+
+                # Prepare data for PCA with significant markers
+                pca_data_significant = combined_autoantibody_df_significant.set_index('Patient ID')[
+                    significant_marker_cols]
+
+                # Perform PCA with significant markers
+                pca_autoantibody_significant, pca_autoantibody_df_significant = perform_pca(
+                    df=pca_data_significant,
+                    n_components=2,
+                    group_labels=group_labels,
+                    title='PCA_Autoantibody_Significant_Markers'
+                )
+                pca_autoantibody_df_significant.to_csv('PCA_Autoantibody_Significant_Markers.csv', index=False)
+                logging.info(
+                    "PCA with significant autoantibody markers saved to 'PCA_Autoantibody_Significant_Markers.csv'.")
+            else:
+                logging.info("No significant autoantibody markers found for PCA.")
         else:
             logging.warning(
                 f"One of the autoantibody groups '{group1_label}' or '{group2_label}' is missing. Skipping Autoantibody Comparisons.")
-
 
 
 if __name__ == '__main__':
