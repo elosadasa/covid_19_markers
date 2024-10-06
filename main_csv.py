@@ -358,162 +358,203 @@ def load_autoantibody_data(file_path: str) -> pd.DataFrame:
         return pd.DataFrame()
 
 
-def extract_autoantibody_groups(df: pd.DataFrame, cytokine_df: pd.DataFrame) -> dict:
+def clean_and_impute_autoantibody_data_wide(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Extracts specific groups from the autoantibody DataFrame.
+    Cleans and imputes autoantibody data in wide format.
     """
-    # Transpose the DataFrame to get patient IDs
-    patients = df.columns[2:]
-    patient_info = pd.DataFrame({'Patient ID': patients})
+    # Transpose the data to have patients as rows
+    id_vars = ['Marker', 'Immunoglobulin']
+    value_vars = [col for col in df.columns if col not in id_vars]
 
-    # Merge with group labels from cytokine data
-    group_labels = cytokine_df[['Patient ID', 'Control/Participant', 'COVID']].drop_duplicates()
-    patient_info = patient_info.merge(group_labels, on='Patient ID', how='left')
+    # Melt the DataFrame to long format
+    melted_df = df.melt(id_vars=id_vars, value_vars=value_vars,
+                        var_name='Patient ID', value_name='Value')
 
+    # Pivot to get patients as rows and markers as columns
+    pivot_df = melted_df.pivot_table(
+        index='Patient ID',
+        columns=['Immunoglobulin', 'Marker'],
+        values='Value'
+    )
+
+    # Flatten MultiIndex columns
+    pivot_df.columns = ['_'.join(col).strip() for col in pivot_df.columns.values]
+
+    # Reset index to include 'Patient ID' as a column
+    pivot_df.reset_index(inplace=True)
+
+    # Convert marker columns to numeric
+    marker_cols = [col for col in pivot_df.columns if col != 'Patient ID']
+    pivot_df[marker_cols] = pivot_df[marker_cols].apply(pd.to_numeric, errors='coerce')
+
+    # Impute missing values. TODO. Disable for imputation. Not necessary for the moment
+    # pivot_df = impute_missing_values_autoantibody(pivot_df, marker_cols)
+
+    logging.info(f"Autoantibody data cleaned and imputed in wide format with shape {pivot_df.shape}.")
+    return pivot_df
+
+
+def impute_missing_values_autoantibody(df: pd.DataFrame, marker_cols: list) -> pd.DataFrame:
+    """
+    Imputes missing values in autoantibody data using median or KNN imputation.
+    """
+    # Calculate missingness per marker
+    missing_proportions = df[marker_cols].isna().mean()
+
+    # Split markers based on missingness
+    median_threshold = 0.2
+    knn_threshold = 0.8
+    markers_median = missing_proportions[missing_proportions <= median_threshold].index.tolist()
+    markers_knn = missing_proportions[
+        (missing_proportions > median_threshold) & (missing_proportions <= knn_threshold)
+        ].index.tolist()
+
+    logging.info(f"{len(markers_median)} autoantibody markers with <=20% missingness.")
+    logging.info(f"{len(markers_knn)} autoantibody markers with >20% and <=80% missingness.")
+
+    # Median Imputation
+    for col in markers_median:
+        median = df[col].median()
+        df[col].fillna(median, inplace=True)
+        logging.debug(f"Imputed median for {col}: {median}")
+
+    # KNN Imputation
+    if markers_knn:
+        imputer = KNNImputer(n_neighbors=5)
+        impute_df = df[markers_knn]
+        imputed_values = imputer.fit_transform(impute_df)
+        imputed_df = pd.DataFrame(imputed_values, columns=markers_knn, index=df.index)
+        df[markers_knn] = imputed_df
+        logging.info(f"Imputed KNN for {len(markers_knn)} autoantibody markers.")
+
+    return df
+
+
+def extract_autoantibody_groups(df: pd.DataFrame, cytokine_groups: dict) -> dict:
+    """
+    Extracts specific groups from the autoantibody DataFrame using group labels from cytokine data.
+    """
+    # Extract Patient IDs for each group from cytokine data
+    control_negative_ids = cytokine_groups['Control_Negative']['Patient ID'].unique()
+    participant_positive_ids = cytokine_groups['Participant_Positive']['Patient ID'].unique()
+
+    # Map Patient IDs to groups
+    df['Group'] = df['Patient ID'].apply(
+        lambda pid: 'Control_Negative' if pid in control_negative_ids else
+        'Participant_Positive' if pid in participant_positive_ids else
+        'Unknown'
+    )
+
+    # Extract groups
     groups = {
-        'Control_Negative': patient_info[
-            (patient_info['Control/Participant'] == 'C') & (patient_info['COVID'] == 'N')
-            ]['Patient ID'].tolist(),
-        'Participant_Positive': patient_info[
-            (patient_info['Control/Participant'] == 'P ') & (patient_info['COVID'] == 'Y')
-            ]['Patient ID'].tolist(),
+        'Control_Negative': df[df['Group'] == 'Control_Negative'],
+        'Participant_Positive': df[df['Group'] == 'Participant_Positive'],
     }
-    for label, patients in groups.items():
-        logging.info(f"{label} group has {len(patients)} patients.")
+    for label, group_df in groups.items():
+        logging.info(f"{label} group has {group_df.shape[0]} patients in autoantibody data.")
     return groups
 
 
-def reshape_autoantibody_data(df: pd.DataFrame) -> pd.DataFrame:
+def normalize_autoantibody_data(df: pd.DataFrame, marker_cols: list) -> pd.DataFrame:
     """
-    Reshapes autoantibody data from wide to long format.
+    Normalizes autoantibody marker columns using Z-score normalization.
     """
-    id_vars = ['Marker', 'Immunoglobulin']
+    scaler = StandardScaler()
+    df[marker_cols] = scaler.fit_transform(df[marker_cols])
+    logging.info("Autoantibody data normalization (Z-score) completed.")
+    return df
+
+
+def reshape_autoantibody_data_long(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Reshapes autoantibody data from wide to long format for statistical tests.
+    """
+    id_vars = ['Patient ID', 'Group']
     value_vars = [col for col in df.columns if col not in id_vars]
     melted_df = df.melt(id_vars=id_vars, value_vars=value_vars,
-                        var_name='Patient ID', value_name='Value')
+                        var_name='Marker', value_name='Value')
+
+    # Attempt to split 'Marker' into 'Immunoglobulin' and 'Antigen'
+    split_marker = melted_df['Marker'].str.split('_', n=1, expand=True)
+
+    # Check if split resulted in two columns
+    if split_marker.shape[1] == 2:
+        melted_df['Immunoglobulin'] = split_marker[0]
+        melted_df['Antigen'] = split_marker[1]
+    else:
+        # Handle cases where the split didn't result in two parts
+        logging.warning("Some markers could not be split into 'Immunoglobulin' and 'Antigen'. Assigning 'Unknown' to 'Immunoglobulin'.")
+        melted_df['Immunoglobulin'] = 'Unknown'
+        melted_df['Antigen'] = melted_df['Marker']
+
     logging.info(f"Autoantibody data reshaped to long format with shape {melted_df.shape}.")
     return melted_df
 
 
+
 def compare_autoantibody_groups(group1_df: pd.DataFrame, group2_df: pd.DataFrame, group1_label: str,
-                                group2_label: str) -> pd.DataFrame:
+                                group2_label: str, significance_level: float = 0.05) -> pd.DataFrame:
     """
     Compares autoantibody markers between two groups.
     """
-    combined_df = pd.concat([
-        group1_df.assign(Group=group1_label),
-        group2_df.assign(Group=group2_label)
-    ])
-
-    combinations_unique = combined_df[['Immunoglobulin', 'Marker']].drop_duplicates()
+    markers = group1_df['Marker'].unique()
     results = []
 
-    for _, row in combinations_unique.iterrows():
-        ig_type = row['Immunoglobulin']
-        marker = row['Marker']
-        marker_data = combined_df[
-            (combined_df['Immunoglobulin'] == ig_type) &
-            (combined_df['Marker'] == marker)
-            ]
-        group1_values = marker_data[marker_data['Group'] == group1_label]['Z_Score'].dropna()
-        group2_values = marker_data[marker_data['Group'] == group2_label]['Z_Score'].dropna()
+    for marker in markers:
+        group1_values = group1_df[group1_df['Marker'] == marker]['Value'].dropna()
+        group2_values = group2_df[group2_df['Marker'] == marker]['Value'].dropna()
 
         if len(group1_values) > 1 and len(group2_values) > 1:
-            t_stat, p_value = ttest_ind(group1_values, group2_values, equal_var=False)
+            # Normality test
+            shapiro_p1 = shapiro(group1_values)[1]
+            shapiro_p2 = shapiro(group2_values)[1]
+            normal = (shapiro_p1 >= significance_level) and (shapiro_p2 >= significance_level)
+
+            # Homoscedasticity test
+            if normal:
+                levene_p = bartlett(group1_values, group2_values)[1]
+                homoscedastic = (levene_p >= significance_level)
+                homoscedasticity_test = 'Bartlett’s Test'
+            else:
+                levene_p = levene(group1_values, group2_values, center='median')[1]
+                homoscedastic = (levene_p >= significance_level)
+                homoscedasticity_test = 'Levene’s Test (median)'
+
+            # Decide which test to use based on assumptions
+            if normal and homoscedastic:
+                t_stat, p_value = ttest_ind(group1_values, group2_values, equal_var=True)
+                test_used = 't-test (equal variances)'
+            elif normal and not homoscedastic:
+                t_stat, p_value = ttest_ind(group1_values, group2_values, equal_var=False)
+                test_used = 'Welch\'s t-test (unequal variances)'
+            else:
+                t_stat, p_value = mannwhitneyu(group1_values, group2_values, alternative='two-sided')
+                test_used = 'Mann-Whitney U Test (non-parametric)'
+
             result = {
                 'Comparison': f'{group1_label} vs {group2_label}',
-                'Immunoglobulin': ig_type,
                 'Marker': marker,
-                f'{group1_label}_Mean_Z': group1_values.mean(),
-                f'{group2_label}_Mean_Z': group2_values.mean(),
-                'T_Statistic': t_stat,
-                'P_Value': p_value
+                f'{group1_label}_Mean': group1_values.mean(),
+                f'{group2_label}_Mean': group2_values.mean(),
+                'Test_Used': test_used,
+                'Statistic': t_stat,
+                'Raw_P_Value': p_value,
+                'Normality_Group1_P': shapiro_p1,
+                'Normality_Group2_P': shapiro_p2,
+                'Homoscedasticity_Test': homoscedasticity_test,
+                'Homoscedasticity_P': levene_p,
+                'Assumption_Normality': normal,
+                'Assumption_Homoscedasticity': homoscedastic
             }
             results.append(result)
 
     results_df = pd.DataFrame(results)
-    results_df.sort_values('P_Value', inplace=True)
-    results_df = adjust_p_values(results_df)
+    results_df.sort_values('Raw_P_Value', inplace=True)
+    results_df = adjust_p_values(results_df, p_value_column='Raw_P_Value', significance_level=significance_level)
     results_df.to_csv('autoantibody_comparison_results.csv', index=False)
-    logging.info("Autoantibody Comparison Results:\n%s", results_df.head())
+    logging.info("Autoantibody Comparison Results saved to 'autoantibody_comparison_results.csv'.")
 
     return results_df
-
-
-def adjust_p_values(results_df: pd.DataFrame, p_value_column: str = 'P_Value',
-                    significance_level: float = 0.05) -> pd.DataFrame:
-    """
-    Adjusts p-values for multiple comparisons using the Benjamini-Hochberg procedure
-    and adds significance flags based on raw and adjusted p-values.
-    """
-    if p_value_column not in results_df.columns:
-        logging.error(f"{p_value_column} column not found in results DataFrame.")
-        return results_df
-
-    p_values = results_df[p_value_column]
-    adjusted = multipletests(p_values, method='fdr_bh')
-    results_df['Adjusted_P_Value'] = adjusted[1]
-    results_df['Significant_Adjusted'] = adjusted[0]
-
-    # Add raw significance flag
-    results_df['Significant_Raw'] = results_df[p_value_column] < significance_level
-
-    return results_df
-
-
-def perform_pca(df: pd.DataFrame, n_components: int = 2, group_labels: pd.Series = None, title: str = "PCA") -> Tuple[
-    PCA, pd.DataFrame]:
-    """
-    Performs PCA on the given DataFrame.
-
-    Parameters:
-        df (pd.DataFrame): The input data.
-        n_components (int): Number of principal components to compute.
-        group_labels (pd.Series): Optional series indicating group membership for coloring.
-        title (str): Title for the PCA plot.
-
-    Returns:
-        Tuple[PCA, pd.DataFrame]: The PCA object and the transformed DataFrame.
-    """
-    if df.empty:
-        logging.warning("Input DataFrame for PCA is empty. Skipping PCA.")
-        return None, pd.DataFrame()
-
-    # Standardize the data
-    scaler = StandardScaler()
-    scaled_data = scaler.fit_transform(df)
-
-    # Initialize PCA
-    pca = PCA(n_components=n_components)
-    principal_components = pca.fit_transform(scaled_data)
-
-    # Create a DataFrame with principal components
-    pca_df = pd.DataFrame(data=principal_components, columns=[f'PC{i + 1}' for i in range(n_components)],
-                          index=df.index)
-
-    if group_labels is not None:
-        pca_df = pca_df.join(group_labels)
-
-        # Plotting
-        plt.figure(figsize=(10, 8))
-        sns.scatterplot(
-            x='PC1', y='PC2',
-            hue='Group',
-            palette='Set1',
-            data=pca_df.reset_index(),
-            alpha=0.7
-        )
-        plt.title(title)
-        plt.xlabel(f'PC1 ({pca.explained_variance_ratio_[0] * 100:.2f}%)')
-        plt.ylabel(f'PC2 ({pca.explained_variance_ratio_[1] * 100:.2f}%)')
-        plt.legend(title='Group')
-        plt.tight_layout()
-        plt.savefig(f'{title}_PCA.png')
-        plt.close()
-
-    logging.info(f"PCA completed for {title}. Explained variance: {pca.explained_variance_ratio_}")
-
-    return pca, pca_df
 
 
 def main():
@@ -532,14 +573,12 @@ def main():
     # Load and filter cytokine data
     cytokine_df = load_cytokine_data(args.cytokine_file)
     cytokine_df = filter_cytokine_data(cytokine_df)
-    autoantibody_df = load_autoantibody_data(args.autoantibody_file)
 
-    # Clean and impute data in wide format
+    # Clean and impute cytokine data in wide format
     cytokine_df = clean_and_impute_cytokine_data_wide(cytokine_df)
 
-    # Extract groups
+    # Extract cytokine groups
     cytokine_groups = extract_cytokine_groups(cytokine_df)
-    autoantibody_groups = extract_autoantibody_groups(autoantibody_df, cytokine_df)
 
     # Define comparisons
     comparisons = [
@@ -593,62 +632,66 @@ def main():
             logging.warning(
                 f"One of the cytokine groups '{group1_label}' or '{group2_label}' is missing. Skipping Cytokine Comparisons.")
 
-    '''
     # --- Autoantibody Data Processing ---
     logging.info("Starting Autoantibody Data Processing...")
 
-    autoantibody_results = []
-    reshaped_auto_df = reshape_autoantibody_data(autoantibody_df)
-    normalized_auto_df = normalize_autoantibody_data(reshaped_auto_df)
+    # Load autoantibody data
+    autoantibody_df = load_autoantibody_data(args.autoantibody_file)
 
-    # Assign group labels
-    normalized_auto_df['Group'] = normalized_auto_df['Patient ID'].map(
-        {pid: 'Control_Negative' if pid in autoantibody_groups['Control_Negative'] else
-        'Participant_Positive' if pid in autoantibody_groups['Participant_Positive'] else 'Unknown'
-         for pid in normalized_auto_df['Patient ID']}
-    )
+    if autoantibody_df.empty:
+        logging.warning("Autoantibody DataFrame is empty. Skipping Autoantibody Data Processing.")
+        return
 
-    # Filter out patients with 'Unknown' group
-    normalized_auto_df = normalized_auto_df[normalized_auto_df['Group'] != 'Unknown']
+    # Clean and impute autoantibody data in wide format
+    autoantibody_df_cleaned = clean_and_impute_autoantibody_data_wide(autoantibody_df)
+
+    # Extract autoantibody groups
+    autoantibody_groups = extract_autoantibody_groups(autoantibody_df_cleaned, cytokine_groups)
 
     for group1_label, group2_label in comparisons:
-        group1_df = normalized_auto_df[normalized_auto_df['Group'] == group1_label]
-        group2_df = normalized_auto_df[normalized_auto_df['Group'] == group2_label]
+        group1_df = autoantibody_groups[group1_label]
+        group2_df = autoantibody_groups[group2_label]
 
-        if group1_df.empty or group2_df.empty:
-            logging.warning(
-                f"One of the autoantibody groups '{group1_label}' or '{group2_label}' is empty. Skipping comparison.")
-            continue
+        if not group1_df.empty and not group2_df.empty:
+            # Log number of samples in each group
+            logging.info(f"Number of {group1_label} samples: {group1_df.shape[0]}")
+            logging.info(f"Number of {group2_label} samples: {group2_df.shape[0]}")
 
-        # Perform statistical comparison
-        result_df = compare_autoantibody_groups(group1_df, group2_df, group1_label, group2_label)
-        autoantibody_results.append(result_df)
+            # Combine data for PCA
+            combined_autoantibody_df = pd.concat([group1_df, group2_df])
 
-    if autoantibody_results:
-        combined_auto_results = pd.concat(autoantibody_results, ignore_index=True)
-        combined_auto_results.to_csv('autoantibody_comparison_results.csv', index=False)
-        logging.info("All Autoantibody Comparisons Completed.")
+            # Extract marker columns
+            marker_cols = [col for col in combined_autoantibody_df.columns if col not in ['Patient ID', 'Group']]
 
-        # Perform PCA for each immunoglobulin type
-        for ig_type in normalized_auto_df['Immunoglobulin'].unique():
-            ig_data = normalized_auto_df[normalized_auto_df['Immunoglobulin'] == ig_type]
-            pivot_df = ig_data.pivot_table(
-                index='Patient ID', columns='Marker', values='Z_Score', aggfunc='mean'
-            ).dropna()
-            group_labels = ig_data[['Patient ID', 'Group']].drop_duplicates().set_index('Patient ID')['Group']
-            group_labels = group_labels.loc[pivot_df.index]
+            # Normalize the data
+            combined_autoantibody_df = normalize_autoantibody_data(combined_autoantibody_df, marker_cols)
+
+            # Prepare data for PCA
+            pca_data = combined_autoantibody_df.set_index('Patient ID')[marker_cols]
+
+            # Extract group labels
+            group_labels = combined_autoantibody_df.set_index('Patient ID')['Group']
 
             # Perform PCA
-            pca, pca_df = perform_pca(
-                df=pivot_df,
+            pca_autoantibody, pca_autoantibody_df = perform_pca(
+                df=pca_data,
                 n_components=2,
                 group_labels=group_labels,
-                title=f'PCA_Autoantibody_{ig_type}'
+                title='PCA_Autoantibody'
             )
-            pca_df.to_csv(f'PCA_Autoantibody_{ig_type}.csv', index=False)
-    else:
-        logging.warning("No Autoantibody Comparisons were performed.")
-    '''
+            pca_autoantibody_df.to_csv('PCA_Autoantibody.csv', index=False)
+            logging.info("PCA results saved to 'PCA_Autoantibody.csv'.")
+
+            # Reshape data for statistical tests
+            group1_long_df = reshape_autoantibody_data_long(group1_df)
+            group2_long_df = reshape_autoantibody_data_long(group2_df)
+
+            # Perform statistical comparison
+            compare_autoantibody_groups(group1_long_df, group2_long_df, group1_label, group2_label)
+        else:
+            logging.warning(
+                f"One of the autoantibody groups '{group1_label}' or '{group2_label}' is missing. Skipping Autoantibody Comparisons.")
+
 
 
 if __name__ == '__main__':
