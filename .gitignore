@@ -399,4 +399,7 @@ fabric.properties
 
 # OS X files
 .DS_Store
+
+# Output files
 *.png
+*.csv
